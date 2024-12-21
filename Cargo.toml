@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+egui = "*"
+eframe = "*"
+egui_extras = "*"
+re_ui = "*"
+re_log = "*"
+egui_tiles = "*"
+rand = "*"
+serialport = "4.6.1"
+egui_material_icons = "*"
