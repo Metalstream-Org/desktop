@@ -1,0 +1,140 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{listings}
+\usepackage{xcolor}
+
+% Colors for code highlighting
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codeblue}{rgb}{0,0,1}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{white},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{codeblue},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codegreen},
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\title{Sensor Communication Protocol Specification}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Overview}
+This document describes the communication protocol used for transmitting data between the master board and the graphical user interface (GUI) in the metal detector project. The protocol is designed to be robust, extendable, and efficient while ensuring all sensor data from up to 8 sensors is transmitted simultaneously in one message.
+
+\section{Message Structure}
+A message consists of the following fields:
+\begin{center}
+    \begin{tabular}{|c|c|l|}
+        \hline
+        \textbf{Field} & \textbf{Size (Bytes)} & \textbf{Description} \\
+        \hline
+        Header & 2 & Fixed value: 0xAA 0x55 \\
+        \hline
+        Message Type & 1 & Specifies the type of message (e.g., data update, command). \\
+        \hline
+        Payload Length & 1 & Number of bytes in the payload. \\
+        \hline
+        Payload & Variable & Data specific to the message type (e.g., sensor values). \\
+        \hline
+        Checksum & 1 & XOR of all bytes except the header. \\
+        \hline
+    \end{tabular}
+\end{center}
+
+\subsection{Field Details}
+\begin{itemize}
+    \item \textbf{Header}: A 2-byte fixed value (0xAA 0x55) marking the start of a message.
+    \item \textbf{Message Type}: Defines the purpose of the message. For example:
+    \begin{itemize}
+        \item 0x01: Sensor data update
+        \item 0x02: Command to master board
+        \item 0x03: Acknowledgment
+    \end{itemize}
+    \item \textbf{Payload Length}: Indicates the number of bytes in the payload.
+    \item \textbf{Payload}: Varies based on the message type. For sensor updates, it contains the values of up to 8 sensors.
+    \item \textbf{Checksum}: XOR of all bytes from Message Type to the end of the Payload.
+\end{itemize}
+
+\section{Sensor Data Update}
+The master board sends sensor readings in a single message. The structure of the payload is as follows:
+\begin{center}
+    \begin{tabular}{|c|c|l|}
+        \hline
+        \textbf{Offset} & \textbf{Size (Bytes)} & \textbf{Description} \\
+        \hline
+        0 & 2 & Sensor 1 value (16 bits) \\
+        \hline
+        2 & 2 & Sensor 2 value (16 bits) \\
+        \hline
+        4 & 2 & Sensor 3 value (16 bits) \\
+        \hline
+        \vdots & \vdots & \vdots \\
+        \hline
+        14 & 2 & Sensor 8 value (16 bits) \\
+        \hline
+    \end{tabular}
+\end{center}
+
+Example payload (hexadecimal):
+\begin{lstlisting}[language=,frame=single]
+12 34 56 78 9A BC DE F0 AB CD EF 01 23 45 67 89
+\end{lstlisting}
+
+\subsection{Example Message}
+Full message in hexadecimal (for 8 sensor readings):
+\begin{lstlisting}[language=,frame=single]
+AA 55 01 10 12 34 56 78 9A BC DE F0 AB CD EF 01 23 45 67 89 XX
+\end{lstlisting}
+Here, \texttt{XX} is the checksum.
+
+\section{Checksum Calculation}
+The checksum is calculated by performing an XOR operation on all bytes from the Message Type to the end of the Payload.
+
+Example Python implementation:
+\begin{lstlisting}[language=Python]
+def calculate_checksum(message):
+    checksum = 0
+    for byte in message[2:]:  # Skip header
+        checksum ^= byte
+    return checksum
+\end{lstlisting}
+
+\section{Extensibility}
+This protocol can be extended for:
+\begin{itemize}
+    \item Additional sensors by increasing the Payload Length field and adding more sensor values to the payload.
+    \item New message types (e.g., configuration commands, error reports).
+    \item Variable payload formats based on Message Type.
+\end{itemize}
+
+\section{Physical Considerations}
+\begin{itemize}
+    \item Use reliable transmission media to prevent data loss.
+    \item Consider adding acknowledgments for critical commands.
+\end{itemize}
+
+\section{Conclusion}
+This protocol provides an efficient and robust way to communicate sensor data and commands between the master board and GUI. By consolidating sensor values into a single message, it ensures data consistency and optimizes transmission.
+
+\end{document}
