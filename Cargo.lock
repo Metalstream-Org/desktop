@@ -1227,6 +1227,8 @@ dependencies = [
  "rand",
  "re_log",
  "re_ui",
+ "serde",
+ "serde_json",
  "serialport",
 ]
 
