@@ -1,21 +1,20 @@
 use eframe::wgpu::hal::vulkan::CommandEncoder;
 use eframe::{egui, CreationContext};
+use egui::accesskit::Point;
+use egui::debug_text::print;
 use egui::Order;
+use egui_plot::{Line, Plot, PlotPoints};
+use egui_tiles::Behavior;
 use re_log::external::log::log_enabled;
 use re_ui::UiExt;
 use serialport::{available_ports, SerialPort, SerialPortBuilder, SerialPortType};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::format;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::mpsc::{Receiver, channel};
-
-// <start_byte><command><payload_length><payload><checksum><end_byte>
-
-
-// _MEAS
 
 
 const KNOWN_MANUFACTURER: &str = "Espressif"; // Vervang door de daadwerkelijke fabrikant die je verwacht
@@ -53,7 +52,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Hardware Connection Example",
+        "Metalshare",
         options,
         Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),
     )
@@ -63,13 +62,19 @@ fn main() -> eframe::Result {
 struct ParsedMessage {
     timestamp: String,
     command: String,
-    fields: std::collections::HashMap<String, String>,
+    fields: HashMap<String, String>,
+}
+
+
+#[derive(Clone, Copy, Debug)]
+struct SensorSample {
+    timestamp: u64,
+    value: u16,
 }
 
 struct MyApp {
-    is_connected: bool,
-    show_connection_window: bool,
-    connection_info: Option<ConnectionInfo>,
+    is_connected: Arc<AtomicBool>,
+    connection_info: Arc<Mutex<Option<ConnectionInfo>>>,
     logs: VecDeque<String>,  // Optimaliseer logs-opslag
     // tx_channel: (std::sync::mpsc::Sender<ChannelMessage>, std::sync::mpsc::Receiver<ChannelMessage>),
     // rx_channel: (std::sync::mpsc::Sender<ChannelMessage>, std::sync::mpsc::Receiver<ChannelMessage>),
@@ -77,8 +82,9 @@ struct MyApp {
     serial_port_path: String,
     
     connection_states: [bool; 8],
+    sensor_values: [SensorSample; 8],
     thread_spawned: bool,
-
+    dimensions: Point,
 }
 
 impl MyApp {
@@ -87,9 +93,9 @@ impl MyApp {
         re_ui::apply_style_and_install_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
 
+
         Self {
             is_connected: Default::default(),
-            show_connection_window: Default::default(),
             connection_info: Default::default(),
             // tx_channel: channel(),
             // rx_channel: channel(),
@@ -97,7 +103,9 @@ impl MyApp {
             log_receiver: Default::default(),
             serial_port_path: Default::default(),
             connection_states: [false; 8],
+            sensor_values: [SensorSample { timestamp: 0, value: 0};8],
             thread_spawned: false,
+            dimensions: Default::default(),
         }
     }
 
@@ -106,9 +114,10 @@ impl MyApp {
         // let (receiver, sender) = channel();
 
         let port_path = Arc::new(self.serial_port_path.clone());
-        let connection_info = Arc::new(Mutex::new(None::<ConnectionInfo>));
-        let connection_info_clone = Arc::clone(&connection_info);
+        let connection_info = self.connection_info.clone();
 
+
+        let is_connected_clone = self.is_connected.clone();
         std::thread::spawn(move || {
             loop {
                 let port_result = serialport::new(&*port_path, 115200)
@@ -117,7 +126,9 @@ impl MyApp {
 
                 match port_result {
                     Ok(bla) => {
-                        *connection_info_clone.lock().unwrap() = Some(ConnectionInfo::new((*port_path).clone(), 115200));
+                        is_connected_clone.store(true, Ordering::Relaxed);
+
+                        *connection_info.lock().unwrap() = Some(ConnectionInfo::new((*port_path).clone(), 115200));
                         sender.send(ChannelMessage::Connected);
                         
                         
@@ -155,10 +166,10 @@ impl MyApp {
                                                         fields,
                                                     };
                                 
-                                                    // Verstuur de parsed message via het kanaal
                                                     sender
-                                                        .send(ChannelMessage::Data(parsed_message))
-                                                        .ok();
+                                                    .send(ChannelMessage::Data(parsed_message))
+                                                    .ok();
+                                                    
                                                 }
                                             }
                                         }
@@ -175,6 +186,7 @@ impl MyApp {
                                         _ => {
                                             println!("andere serial error {}", err);
                                             sender.send(ChannelMessage::Error(err.to_string())).ok();
+                                            is_connected_clone.store(false, Ordering::Relaxed);
                                             break;
                                         }
                                     }
@@ -194,24 +206,19 @@ impl MyApp {
     
 
         self.log_receiver = Some(receiver);
-        self.connection_info = connection_info.lock().unwrap().clone();
     }
 }
 
 impl eframe::App for MyApp {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // TODO: drop port
-        // if let Some(connection_info) = self.connection_info.take() {
-        //     drop(connection_info.connection);
-        // }
-    }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let is_connected = self.is_connected.load(Ordering::Relaxed);
+
         if !self.thread_spawned && self.serial_port_path.len() > 0 {
             self.spawn_serial_thread();
             self.thread_spawned = true;
         }
 
-        if !self.is_connected {
+        if !is_connected {
             let ports = available_ports().expect("bla");
 
             for port in ports {
@@ -226,8 +233,7 @@ impl eframe::App for MyApp {
                 }
             }
         }
-
-
+        
         if let Some(receiver) = &self.log_receiver {
             for log in receiver.try_iter() {
                 match log {
@@ -237,19 +243,45 @@ impl eframe::App for MyApp {
                         if self.logs.len() > 100 {
                             self.logs.pop_front();
                         }
-                        
-                        if let Some(id) = log_message.fields.get("ID") {
-                            if let Some(connected) = log_message.fields.get("C") {
-                                self.connection_states[id.parse::<usize>().unwrap()-1] = connected.parse::<u8>().unwrap() != 0;
-                            }
-                        };
+
+                        match log_message.command.as_str()
+                        {
+                            "SMS" => {
+                                if let Some(id) = log_message.fields.get("ID") {
+                                    let index = id.parse::<usize>().unwrap()-1;
+        
+                                    if let Some(connected) = log_message.fields.get("C") {
+                                        self.connection_states[index] = connected.parse::<u8>().unwrap() != 0;
+                                    }
+        
+                                    if let (Some(Ok(timestamp)), Some(Ok(value))) = (
+                                        log_message.fields.get("T").map(|t| t.parse::<u64>()),
+                                        log_message.fields.get("V").map(|v| v.parse::<u16>()),
+                                    ) {
+                                        self.sensor_values[index] = SensorSample { timestamp, value };
+                                    }
+                                };
+                            },
+                            "MET" => {
+                                if let (Some(Ok(width)), Some(Ok(length))) = (
+                                    log_message.fields.get("W").map(|t| t.parse::<f64>()),
+                                    log_message.fields.get("L").map(|v| v.parse::<f64>()),
+                                ) {
+                                    self.dimensions = Point::new(width, length)
+                                }
+
+                                println!("{:?}", log_message.fields)
+
+                            },
+                            _ => println!("else"),
+                        }
                     }
                     ChannelMessage::Error(bla) => {
                         println!("Error bla: {}", bla);
-                        self.is_connected = false;
+                        // self.is_connected = false;
                     },
                     ChannelMessage::Connected => {
-                        self.is_connected = true;
+                        // self.is_connected = true;
                     }
                 }
             }
@@ -295,15 +327,19 @@ impl eframe::App for MyApp {
         egui::TopBottomPanel::bottom("bottom_panel")
             .frame(re_ui::DesignTokens::bottom_panel_frame())
             .show(ctx, |ui| {
-                if let Some(ref connection_info) = self.connection_info {
-                    ui.horizontal(|ui| {
-                        if ui.button(egui::RichText::new(format!("{} {}", egui_material_icons::icons::ICON_POWER, connection_info.port_path)).size(10.0)).clicked() {
-                            // Acties wanneer de knop wordt geklikt
-                            println!("USB icon button clicked!");
+                ui.horizontal(|ui| {
+                    if is_connected {
+                        if let Some(ref connection_info) = self.connection_info.lock().unwrap().as_ref() {
+                            if ui.button(egui::RichText::new(format!("{} {}", egui_material_icons::icons::ICON_POWER, connection_info.port_path)).size(10.0)).clicked() {
+                                // Acties wanneer de knop wordt geklikt
+                                println!("USB icon button clicked!");
+                            }
+                            let _ = ui.label(egui::RichText::new(connection_info.baudrate.to_string()).size(10.0));
                         }
-                        let _ = ui.label(egui::RichText::new(connection_info.baudrate.to_string()).size(10.0));
-                    });
-                }
+                    } else {
+                        ui.add(egui::Spinner::new());
+                    }
+                });
             });
 
         
@@ -323,7 +359,9 @@ impl eframe::App for MyApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.button("Start");
                     ui.button("Stop");
-                    ui.button("Calibrate");
+                    if ui.button("Calibrate").clicked() {
+
+                    };
                 });
 
                 re_ui::list_item::list_item_scope(ui, "sensor_states", |ui| {
@@ -355,6 +393,30 @@ impl eframe::App for MyApp {
                 ..Default::default()
             }).show(ctx, |ui| {
                 ui.heading("Dit is de root applicatie.");
+                // self.tree.ui(self, ui);
+
+                // Plot::new("ADC Sensor Data").show(ui, |plot_ui| {
+                //     for (i, sensor) in self.sensor_values.iter().enumerate() {
+                        // let values: Vec<Value> = sensor
+                        //     .iter()
+                        //     .map(|data| Value::new(data.timestamp as f64 / 1_000_000.0, data.value as f64))
+                        //     .collect();
+
+                        // let line = Line::new(PlotPoints::new(sensor)).name(format!("Sensor {}", i + 1));
+                        // plot_ui.line(line);
+                //     }
+                // });
+
+                ui.group(|ui| {
+                    ui.label(format!("Width: {}mm", self.dimensions.x));
+                    ui.label(format!("Length: {}mm", self.dimensions.y));
+                });
+
+                for (i, sample) in self.sensor_values.iter().enumerate() {
+                    ui.group(|ui| {
+                        ui.label(format!("S0{}: {}", i+1, sample.value.to_string()));
+                    });
+                }
 
                 eframe::egui::ScrollArea::vertical()
                 .auto_shrink(false)
@@ -365,15 +427,10 @@ impl eframe::App for MyApp {
                     }
                     ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
                 });
-
-                if let Some(ref mut connection_info) = self.connection_info {
-                    ui.label(format!("Verbonden met: {}", connection_info.port_path));
-                    ui.label(format!("Baudrate: {}", connection_info.baudrate));
-                }
             });
 
 
-            if self.show_connection_window {
+            if !is_connected {
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("connection_window"),
                     egui::ViewportBuilder::default()
@@ -387,15 +444,11 @@ impl eframe::App for MyApp {
                                 // self.show_connection_window = false;
                                 // self.is_connected = true;
                             }
-    
-                            if ui.button("Sluiten").clicked() {
-                                self.show_connection_window = false
-                            }
                         });
                     },
                 );
             }
-
+            
             ctx.request_repaint_after(std::time::Duration::from_millis(1000/60));
     }
 }
