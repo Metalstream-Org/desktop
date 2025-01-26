@@ -6,7 +6,7 @@ use egui::Order;
 use egui_plot::{Line, Plot, PlotPoints};
 use egui_tiles::Behavior;
 use re_log::external::log::log_enabled;
-use re_ui::UiExt;
+use re_ui::{DesignTokens, UiExt};
 use serialport::{available_ports, SerialPort, SerialPortBuilder, SerialPortType};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::format;
@@ -73,6 +73,7 @@ struct SensorSample {
 }
 
 struct MyApp {
+    tree: egui_tiles::Tree<TabType>,
     is_connected: Arc<AtomicBool>,
     connection_info: Arc<Mutex<Option<ConnectionInfo>>>,
     logs: VecDeque<String>,  // Optimaliseer logs-opslag
@@ -93,8 +94,16 @@ impl MyApp {
         re_ui::apply_style_and_install_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
 
+        let tabs: Vec<TabType> = vec![
+            Arc::new(OverviewTab),
+            Arc::new(SettingsTab),
+        ];
+
+
+        let tree = egui_tiles::Tree::new_tabs(egui::Id::new("tree"), tabs);
 
         Self {
+            tree,
             is_connected: Default::default(),
             connection_info: Default::default(),
             // tx_channel: channel(),
@@ -389,23 +398,9 @@ impl eframe::App for MyApp {
 
             egui::CentralPanel::default().frame(egui::Frame {
                 fill: ctx.style().visuals.panel_fill,
-                inner_margin: egui::Margin::same(5.0),
                 ..Default::default()
             }).show(ctx, |ui| {
-                ui.heading("Dit is de root applicatie.");
-                // self.tree.ui(self, ui);
-
-                // Plot::new("ADC Sensor Data").show(ui, |plot_ui| {
-                //     for (i, sensor) in self.sensor_values.iter().enumerate() {
-                        // let values: Vec<Value> = sensor
-                        //     .iter()
-                        //     .map(|data| Value::new(data.timestamp as f64 / 1_000_000.0, data.value as f64))
-                        //     .collect();
-
-                        // let line = Line::new(PlotPoints::new(sensor)).name(format!("Sensor {}", i + 1));
-                        // plot_ui.line(line);
-                //     }
-                // });
+                tabs_ui(ui, &mut self.tree);
 
                 ui.group(|ui| {
                     ui.label(format!("Width: {}mm", self.dimensions.x));
@@ -413,20 +408,20 @@ impl eframe::App for MyApp {
                 });
 
                 for (i, sample) in self.sensor_values.iter().enumerate() {
-                    ui.group(|ui| {
+                    ui.group(|ui: &mut egui::Ui| {
                         ui.label(format!("S0{}: {}", i+1, sample.value.to_string()));
                     });
                 }
 
-                eframe::egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    for log in &self.logs {
-                        // Fallback voor ongeldige logs
-                        ui.label(egui::RichText::new(log).monospace());
-                    }
-                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-                });
+                // eframe::egui::ScrollArea::vertical()
+                // .auto_shrink(false)
+                // .show(ui, |ui| {
+                //     for log in &self.logs {
+                //         // Fallback voor ongeldige logs
+                //         ui.label(egui::RichText::new(log).monospace());
+                //     }
+                //     ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                // });
             });
 
 
@@ -450,5 +445,100 @@ impl eframe::App for MyApp {
             }
             
             ctx.request_repaint_after(std::time::Duration::from_millis(1000/60));
+    }
+}
+
+fn tabs_ui(ui: &mut egui::Ui, tree: &mut egui_tiles::Tree<TabType>) {
+    tree.ui(&mut MyTileTreeBehavior {}, ui);
+}
+
+pub trait Tab: Send + Sync {
+    fn title(&self) -> String;
+    fn ui(&self, ui: &mut egui::Ui);
+}
+
+pub struct OverviewTab;
+
+impl Tab for OverviewTab {
+    fn title(&self) -> String {
+        "Overview".to_string()
+    }
+
+    fn ui(&self, ui: &mut egui::Ui) {
+        // eframe::egui::ScrollArea::vertical()
+        // .auto_shrink(false)
+        // .show(ui, |ui| {
+        //     for log in &self.logs {
+        //         // Fallback voor ongeldige logs
+        //         ui.label(egui::RichText::new(log).monospace());
+        //     }
+        //     ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+        // });
+    }
+}
+
+pub struct SettingsTab;
+
+impl Tab for SettingsTab {
+    fn title(&self) -> String {
+        "Settings".to_string()
+    }
+
+    fn ui(&self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        ui.label("Adjust your settings here.");
+    }
+}
+
+
+pub type TabType = Arc<dyn Tab>;
+
+
+
+// pub type Tab = i32;
+
+struct MyTileTreeBehavior {}
+
+impl egui_tiles::Behavior<TabType> for MyTileTreeBehavior {
+    fn pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _tile_id: egui_tiles::TileId,
+        pane: &mut TabType,
+    ) -> egui_tiles::UiResponse {
+        egui::Frame::default().inner_margin(4.0).show(ui, |ui| {
+            pane.ui(ui);
+        });
+
+        Default::default()
+    }
+
+    fn tab_title_for_pane(&mut self, pane: &TabType) -> egui::WidgetText {
+        pane.title().into()
+    }
+
+    // Styling:
+
+    fn tab_outline_stroke(
+        &self,
+        _visuals: &egui::Visuals,
+        _tiles: &egui_tiles::Tiles<TabType>,
+        _tile_id: egui_tiles::TileId,
+        _tab_state: &egui_tiles::TabState,
+    ) -> egui::Stroke {
+        egui::Stroke::NONE
+    }
+
+    /// The height of the bar holding tab titles.
+    fn tab_bar_height(&self, _style: &egui::Style) -> f32 {
+        re_ui::DesignTokens::title_bar_height()
+    }
+
+    /// What are the rules for simplifying the tree?
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        egui_tiles::SimplificationOptions {
+            all_panes_must_have_tabs: true,
+            ..Default::default()
+        }
     }
 }
