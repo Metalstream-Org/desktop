@@ -38,12 +38,6 @@ impl ConnectionInfo {
     }
 }
 
-enum ChannelMessage {
-    Data(ParsedMessage),
-    Error(String),
-    Connected,
-}
-
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_app_id("metalstream").with_inner_size([720.0, 480.0]),
@@ -79,7 +73,7 @@ struct MyApp {
     logs: VecDeque<String>,  // Optimaliseer logs-opslag
     // tx_channel: (std::sync::mpsc::Sender<ChannelMessage>, std::sync::mpsc::Receiver<ChannelMessage>),
     // rx_channel: (std::sync::mpsc::Sender<ChannelMessage>, std::sync::mpsc::Receiver<ChannelMessage>),
-    log_receiver: Option<Receiver<ChannelMessage>>,  // Voor inkomende logs
+    log_receiver: Option<Receiver<ParsedMessage>>,  // Voor inkomende logs
     serial_port_path: String,
     
     connection_states: [bool; 8],
@@ -138,7 +132,6 @@ impl MyApp {
                         is_connected_clone.store(true, Ordering::Relaxed);
 
                         *connection_info.lock().unwrap() = Some(ConnectionInfo::new((*port_path).clone(), 115200));
-                        sender.send(ChannelMessage::Connected);
                         
                         
                         let mut port = bla;
@@ -176,7 +169,7 @@ impl MyApp {
                                                     };
                                 
                                                     sender
-                                                    .send(ChannelMessage::Data(parsed_message))
+                                                    .send(parsed_message)
                                                     .ok();
                                                     
                                                 }
@@ -194,7 +187,6 @@ impl MyApp {
                                         },
                                         _ => {
                                             println!("andere serial error {}", err);
-                                            sender.send(ChannelMessage::Error(err.to_string())).ok();
                                             is_connected_clone.store(false, Ordering::Relaxed);
                                             break;
                                         }
@@ -244,54 +236,43 @@ impl eframe::App for MyApp {
         }
         
         if let Some(receiver) = &self.log_receiver {
-            for log in receiver.try_iter() {
-                match log {
-                    ChannelMessage::Data(log_message) => {
-                        self.logs.push_back(format!("{} - command: {}", log_message.timestamp, log_message.command));
+            for log_message in receiver.try_iter() {
+                self.logs.push_back(format!("{} - command: {}", log_message.timestamp, log_message.command));
 
-                        if self.logs.len() > 100 {
-                            self.logs.pop_front();
-                        }
+                if self.logs.len() > 100 {
+                    self.logs.pop_front();
+                }
 
-                        match log_message.command.as_str()
-                        {
-                            "SMS" => {
-                                if let Some(id) = log_message.fields.get("ID") {
-                                    let index = id.parse::<usize>().unwrap()-1;
-        
-                                    if let Some(connected) = log_message.fields.get("C") {
-                                        self.connection_states[index] = connected.parse::<u8>().unwrap() != 0;
-                                    }
-        
-                                    if let (Some(Ok(timestamp)), Some(Ok(value))) = (
-                                        log_message.fields.get("T").map(|t| t.parse::<u64>()),
-                                        log_message.fields.get("V").map(|v| v.parse::<u16>()),
-                                    ) {
-                                        self.sensor_values[index] = SensorSample { timestamp, value };
-                                    }
-                                };
-                            },
-                            "MET" => {
-                                if let (Some(Ok(width)), Some(Ok(length))) = (
-                                    log_message.fields.get("W").map(|t| t.parse::<f64>()),
-                                    log_message.fields.get("L").map(|v| v.parse::<f64>()),
-                                ) {
-                                    self.dimensions = Point::new(width, length)
-                                }
+                match log_message.command.as_str()
+                {
+                    "SMS" => {
+                        if let Some(id) = log_message.fields.get("ID") {
+                            let index = id.parse::<usize>().unwrap()-1;
 
-                                println!("{:?}", log_message.fields)
+                            if let Some(connected) = log_message.fields.get("C") {
+                                self.connection_states[index] = connected.parse::<u8>().unwrap() != 0;
+                            }
 
-                            },
-                            _ => println!("else"),
-                        }
-                    }
-                    ChannelMessage::Error(bla) => {
-                        println!("Error bla: {}", bla);
-                        // self.is_connected = false;
+                            if let (Some(Ok(timestamp)), Some(Ok(value))) = (
+                                log_message.fields.get("T").map(|t| t.parse::<u64>()),
+                                log_message.fields.get("V").map(|v| v.parse::<u16>()),
+                            ) {
+                                self.sensor_values[index] = SensorSample { timestamp, value };
+                            }
+                        };
                     },
-                    ChannelMessage::Connected => {
-                        // self.is_connected = true;
-                    }
+                    "MET" => {
+                        if let (Some(Ok(width)), Some(Ok(length))) = (
+                            log_message.fields.get("W").map(|t| t.parse::<f64>()),
+                            log_message.fields.get("L").map(|v| v.parse::<f64>()),
+                        ) {
+                            self.dimensions = Point::new(width, length)
+                        }
+
+                        println!("{:?}", log_message.fields)
+
+                    },
+                    _ => println!("else"),
                 }
             }
         }
