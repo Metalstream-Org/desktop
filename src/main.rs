@@ -406,6 +406,7 @@ impl eframe::App for MyApp {
             });
 
 
+            // Laat een los window zien als de hoofdapplicatie niet kan verbinden met het master board
             if !is_connected {
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("connection_window"),
@@ -414,12 +415,8 @@ impl eframe::App for MyApp {
                         .with_inner_size([300.0, 150.0]),
                     |ctx, _class| {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            // ui.label(&self.connection_message);
-    
-                            if ui.button("Opnieuw proberen").clicked() {
-                                // self.show_connection_window = false;
-                                // self.is_connected = true;
-                            }
+                            ui.heading("Kan geen verbinding maken met de Metalstream Hub");
+                            ui.label("De applicatie kan geen verbinding maken met het USB-apparaat. Controleer of het apparaat correct is aangesloten en probeer het opnieuw.");
                         });
                     },
                 );
