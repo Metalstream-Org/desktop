@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use std::sync::mpsc::{Receiver, channel};
 
 
+const TARGET_FRAME_RATE: usize = 60;
 const KNOWN_MANUFACTURER: &str = "Espressif"; // Vervang door de daadwerkelijke fabrikant die je verwacht
 
 #[derive(Clone)]
@@ -60,14 +61,14 @@ struct ParsedMessage {
 }
 
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Default, Clone, Copy, Debug)]
 struct SensorSample {
     timestamp: u64,
     value: u16,
 }
 
-struct MyApp {
-    tree: egui_tiles::Tree<TabType>,
+#[derive(Default)]
+struct GlobalState {
     is_connected: Arc<AtomicBool>,
     connection_info: Arc<Mutex<Option<ConnectionInfo>>>,
     logs: VecDeque<String>,  // Optimaliseer logs-opslag
@@ -80,6 +81,11 @@ struct MyApp {
     sensor_values: [SensorSample; 8],
     thread_spawned: bool,
     dimensions: Point,
+    speed: f64,
+}
+
+struct MyApp {
+    state: GlobalState,
 }
 
 impl MyApp {
@@ -88,27 +94,8 @@ impl MyApp {
         re_ui::apply_style_and_install_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
 
-        let tabs: Vec<TabType> = vec![
-            Arc::new(OverviewTab),
-            Arc::new(SettingsTab),
-        ];
-
-
-        let tree = egui_tiles::Tree::new_tabs(egui::Id::new("tree"), tabs);
-
         Self {
-            tree,
-            is_connected: Default::default(),
-            connection_info: Default::default(),
-            // tx_channel: channel(),
-            // rx_channel: channel(),
-            logs: VecDeque::with_capacity(100),
-            log_receiver: Default::default(),
-            serial_port_path: Default::default(),
-            connection_states: [false; 8],
-            sensor_values: [SensorSample { timestamp: 0, value: 0};8],
-            thread_spawned: false,
-            dimensions: Default::default(),
+            state: Default::default(),
         }
     }
 
@@ -116,11 +103,11 @@ impl MyApp {
         let (sender, receiver) = channel();
         // let (receiver, sender) = channel();
 
-        let port_path = Arc::new(self.serial_port_path.clone());
-        let connection_info = self.connection_info.clone();
+        let port_path = Arc::new(self.state.serial_port_path.clone());
+        let connection_info = self.state.connection_info.clone();
 
 
-        let is_connected_clone = self.is_connected.clone();
+        let is_connected_clone = self.state.is_connected.clone();
         std::thread::spawn(move || {
             loop {
                 let port_result = serialport::new(&*port_path, 115200)
@@ -206,17 +193,17 @@ impl MyApp {
         });
     
 
-        self.log_receiver = Some(receiver);
+        self.state.log_receiver = Some(receiver);
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let is_connected = self.is_connected.load(Ordering::Relaxed);
+        let is_connected = self.state.is_connected.load(Ordering::Relaxed);
 
-        if !self.thread_spawned && self.serial_port_path.len() > 0 {
+        if !self.state.thread_spawned && self.state.serial_port_path.len() > 0 {
             self.spawn_serial_thread();
-            self.thread_spawned = true;
+            self.state.thread_spawned = true;
         }
 
         if !is_connected {
@@ -226,21 +213,19 @@ impl eframe::App for MyApp {
                 if let SerialPortType::UsbPort(usb) = &port.port_type {
                     if let Some(manufacturer) = &usb.manufacturer {
                         if manufacturer == KNOWN_MANUFACTURER {
-                            println!("Manufacturer found, trying to connect {}", port.port_name);
-                            self.serial_port_path = port.port_name;
-                            // return try_connect(&port.port_name);
+                            self.state.serial_port_path = port.port_name;
                         }
                     }
                 }
             }
         }
         
-        if let Some(receiver) = &self.log_receiver {
+        if let Some(receiver) = &self.state.log_receiver {
             for log_message in receiver.try_iter() {
-                self.logs.push_back(format!("{} - command: {}", log_message.timestamp, log_message.command));
+                self.state.logs.push_back(format!("{} - command: {}", log_message.timestamp, log_message.command));
 
-                if self.logs.len() > 100 {
-                    self.logs.pop_front();
+                if self.state.logs.len() > 100 {
+                    self.state.logs.pop_front();
                 }
 
                 match log_message.command.as_str()
@@ -250,23 +235,25 @@ impl eframe::App for MyApp {
                             let index = id.parse::<usize>().unwrap()-1;
 
                             if let Some(connected) = log_message.fields.get("C") {
-                                self.connection_states[index] = connected.parse::<u8>().unwrap() != 0;
+                                self.state.connection_states[index] = connected.parse::<u8>().unwrap() != 0;
                             }
 
                             if let (Some(Ok(timestamp)), Some(Ok(value))) = (
                                 log_message.fields.get("T").map(|t| t.parse::<u64>()),
                                 log_message.fields.get("V").map(|v| v.parse::<u16>()),
                             ) {
-                                self.sensor_values[index] = SensorSample { timestamp, value };
+                                self.state.sensor_values[index] = SensorSample { timestamp, value };
                             }
                         };
                     },
                     "MET" => {
-                        if let (Some(Ok(width)), Some(Ok(length))) = (
+                        if let (Some(Ok(width)), Some(Ok(length)), Some(Ok(speed))) = (
                             log_message.fields.get("W").map(|t| t.parse::<f64>()),
                             log_message.fields.get("L").map(|v| v.parse::<f64>()),
+                            log_message.fields.get("S").map(|v| v.parse::<f64>()),
                         ) {
-                            self.dimensions = Point::new(width, length)
+                            self.state.dimensions = Point::new(width, length);
+                            self.state.speed = speed;
                         }
 
                         println!("{:?}", log_message.fields)
@@ -319,7 +306,7 @@ impl eframe::App for MyApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if is_connected {
-                        if let Some(ref connection_info) = self.connection_info.lock().unwrap().as_ref() {
+                        if let Some(ref connection_info) = self.state.connection_info.lock().unwrap().as_ref() {
                             if ui.button(egui::RichText::new(format!("{} {}", egui_material_icons::icons::ICON_POWER, connection_info.port_path)).size(10.0)).clicked() {
                                 // Acties wanneer de knop wordt geklikt
                                 println!("USB icon button clicked!");
@@ -357,10 +344,11 @@ impl eframe::App for MyApp {
                 re_ui::list_item::list_item_scope(ui, "sensor_states", |ui| {
                 ui.section_collapsing_header("Sensoren & Status")
                     .show(ui, |ui| {
-                        for (i, connected) in self.connection_states.iter().enumerate() {
+                        for (i, connected) in self.state.connection_states.iter().enumerate() {
                             ui.horizontal(|ui| {
-                                ui.label(format!("Sensor S0{}", i + 1)); // Link label
+                                ui.label(format!("Sensor S0{}", i + 1));
                                 
+                                // Laat een icoontje zien op basis van de verbonden toestand
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if *connected {
                                         ui.label(egui_material_icons::icon_text(egui_material_icons::icons::ICON_WIFI_TETHERING)
@@ -381,28 +369,29 @@ impl eframe::App for MyApp {
                 fill: ctx.style().visuals.panel_fill,
                 ..Default::default()
             }).show(ctx, |ui| {
-                tabs_ui(ui, &mut self.tree);
 
+                // Geef de breedte, lengte en snelheid weer in de GUI.
                 ui.group(|ui| {
-                    ui.label(format!("Width: {}mm", self.dimensions.x));
-                    ui.label(format!("Length: {}mm", self.dimensions.y));
+                    ui.label(format!("Width: {}mm", self.state.dimensions.x));
+                    ui.label(format!("Length: {}mm", self.state.dimensions.y));
+                    ui.label(format!("Snelheid: {}mm", self.state.speed));
                 });
 
-                for (i, sample) in self.sensor_values.iter().enumerate() {
+                for (i, sample) in self.state.sensor_values.iter().enumerate() {
                     ui.group(|ui: &mut egui::Ui| {
                         ui.label(format!("S0{}: {}", i+1, sample.value.to_string()));
                     });
                 }
 
-                // eframe::egui::ScrollArea::vertical()
-                // .auto_shrink(false)
-                // .show(ui, |ui| {
-                //     for log in &self.logs {
-                //         // Fallback voor ongeldige logs
-                //         ui.label(egui::RichText::new(log).monospace());
-                //     }
-                //     ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-                // });
+                // Laat de seriele communicatie zien in een scrollable area.
+                eframe::egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    for log in &self.state.logs {
+                        ui.label(egui::RichText::new(log).monospace());
+                    }
+                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                });
             });
 
 
@@ -411,10 +400,10 @@ impl eframe::App for MyApp {
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("connection_window"),
                     egui::ViewportBuilder::default()
-                        .with_title("Hardware Connection")
+                        .with_title("Verbinding mislukt")
                         .with_inner_size([300.0, 150.0]),
                     |ctx, _class| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::CentralPanel::default().show(ctx, |ui| {    
                             ui.heading("Kan geen verbinding maken met de Metalstream Hub");
                             ui.label("De applicatie kan geen verbinding maken met het USB-apparaat. Controleer of het apparaat correct is aangesloten en probeer het opnieuw.");
                         });
@@ -422,101 +411,7 @@ impl eframe::App for MyApp {
                 );
             }
             
-            ctx.request_repaint_after(std::time::Duration::from_millis(1000/60));
-    }
-}
-
-fn tabs_ui(ui: &mut egui::Ui, tree: &mut egui_tiles::Tree<TabType>) {
-    tree.ui(&mut MyTileTreeBehavior {}, ui);
-}
-
-pub trait Tab: Send + Sync {
-    fn title(&self) -> String;
-    fn ui(&self, ui: &mut egui::Ui);
-}
-
-pub struct OverviewTab;
-
-impl Tab for OverviewTab {
-    fn title(&self) -> String {
-        "Overview".to_string()
-    }
-
-    fn ui(&self, ui: &mut egui::Ui) {
-        // eframe::egui::ScrollArea::vertical()
-        // .auto_shrink(false)
-        // .show(ui, |ui| {
-        //     for log in &self.logs {
-        //         // Fallback voor ongeldige logs
-        //         ui.label(egui::RichText::new(log).monospace());
-        //     }
-        //     ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-        // });
-    }
-}
-
-pub struct SettingsTab;
-
-impl Tab for SettingsTab {
-    fn title(&self) -> String {
-        "Settings".to_string()
-    }
-
-    fn ui(&self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.label("Adjust your settings here.");
-    }
-}
-
-
-pub type TabType = Arc<dyn Tab>;
-
-
-
-// pub type Tab = i32;
-
-struct MyTileTreeBehavior {}
-
-impl egui_tiles::Behavior<TabType> for MyTileTreeBehavior {
-    fn pane_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        _tile_id: egui_tiles::TileId,
-        pane: &mut TabType,
-    ) -> egui_tiles::UiResponse {
-        egui::Frame::default().inner_margin(4.0).show(ui, |ui| {
-            pane.ui(ui);
-        });
-
-        Default::default()
-    }
-
-    fn tab_title_for_pane(&mut self, pane: &TabType) -> egui::WidgetText {
-        pane.title().into()
-    }
-
-    // Styling:
-
-    fn tab_outline_stroke(
-        &self,
-        _visuals: &egui::Visuals,
-        _tiles: &egui_tiles::Tiles<TabType>,
-        _tile_id: egui_tiles::TileId,
-        _tab_state: &egui_tiles::TabState,
-    ) -> egui::Stroke {
-        egui::Stroke::NONE
-    }
-
-    /// The height of the bar holding tab titles.
-    fn tab_bar_height(&self, _style: &egui::Style) -> f32 {
-        re_ui::DesignTokens::title_bar_height()
-    }
-
-    /// What are the rules for simplifying the tree?
-    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
-        egui_tiles::SimplificationOptions {
-            all_panes_must_have_tabs: true,
-            ..Default::default()
-        }
+            // Repaint TARGET_FRAME_RATE frames per seconde
+            ctx.request_repaint_after(std::time::Duration::from_millis((1000/TARGET_FRAME_RATE).try_into().unwrap()));
     }
 }
