@@ -1,15 +1,14 @@
+use eframe::wgpu::core::global::Global;
 use eframe::wgpu::hal::vulkan::CommandEncoder;
 use eframe::{egui, CreationContext};
 use egui::accesskit::Point;
 use egui::debug_text::print;
-use egui::Order;
-use egui_plot::{Line, Plot, PlotPoints};
-use egui_tiles::Behavior;
+use egui::{Id, Order};
 use re_log::external::log::log_enabled;
 use re_ui::{DesignTokens, UiExt};
 use serialport::{available_ports, SerialPort, SerialPortBuilder, SerialPortType};
 use std::collections::{HashMap, VecDeque};
-use std::fmt::format;
+use std::fmt::{self, format};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -60,6 +59,21 @@ struct ParsedMessage {
     fields: HashMap<String, String>,
 }
 
+impl fmt::Display for ParsedMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}] {}: {}",
+            self.timestamp,
+            self.command,
+            self.fields
+                .iter()
+                .map(|(key, value)| format!("{}={}", key, value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
 
 #[derive(Default, Clone, Copy, Debug)]
 struct SensorSample {
@@ -68,7 +82,7 @@ struct SensorSample {
 }
 
 #[derive(Default)]
-struct GlobalState {
+pub struct GlobalState {
     is_connected: Arc<AtomicBool>,
     connection_info: Arc<Mutex<Option<ConnectionInfo>>>,
     logs: VecDeque<String>,  // Optimaliseer logs-opslag
@@ -85,6 +99,7 @@ struct GlobalState {
 }
 
 struct MyApp {
+    tree: egui_tiles::Tree<Tab>,
     state: GlobalState,
 }
 
@@ -94,7 +109,15 @@ impl MyApp {
         re_ui::apply_style_and_install_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
 
+        let tabs: Vec<Tab> = vec![
+            Arc::new(LogsTab),
+            Arc::new(Settingstab),
+        ];
+
+        let tree = egui_tiles::Tree::new_tabs(Id::new("bla"), tabs);
+        
         Self {
+            tree,
             state: Default::default(),
         }
     }
@@ -222,7 +245,8 @@ impl eframe::App for MyApp {
         
         if let Some(receiver) = &self.state.log_receiver {
             for log_message in receiver.try_iter() {
-                self.state.logs.push_back(format!("{} - command: {}", log_message.timestamp, log_message.command));
+                // self.state.logs.push_back(format!("{} - command: {} - fields: {:?}", log_message.timestamp, log_message.command, log_message.fields));
+                self.state.logs.push_back(log_message.to_string());
 
                 if self.state.logs.len() > 100 {
                     self.state.logs.pop_front();
@@ -370,28 +394,13 @@ impl eframe::App for MyApp {
                 ..Default::default()
             }).show(ctx, |ui| {
 
-                // Geef de breedte, lengte en snelheid weer in de GUI.
-                ui.group(|ui| {
-                    ui.label(format!("Width: {}mm", self.state.dimensions.x));
-                    ui.label(format!("Length: {}mm", self.state.dimensions.y));
-                    ui.label(format!("Snelheid: {}mm", self.state.speed));
-                });
+                self.tree.ui(&mut self.state, ui);
 
                 for (i, sample) in self.state.sensor_values.iter().enumerate() {
                     ui.group(|ui: &mut egui::Ui| {
                         ui.label(format!("S0{}: {}", i+1, sample.value.to_string()));
                     });
                 }
-
-                // Laat de seriele communicatie zien in een scrollable area.
-                eframe::egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    for log in &self.state.logs {
-                        ui.label(egui::RichText::new(log).monospace());
-                    }
-                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-                });
             });
 
 
@@ -413,5 +422,91 @@ impl eframe::App for MyApp {
             
             // Repaint TARGET_FRAME_RATE frames per seconde
             ctx.request_repaint_after(std::time::Duration::from_millis((1000/TARGET_FRAME_RATE).try_into().unwrap()));
+    }
+}
+
+
+pub trait RenderableTab {
+    fn title(&self) -> &str;
+    fn ui(&self, ui: &mut egui::Ui, state: &mut GlobalState);
+}
+
+pub type Tab = Arc<dyn RenderableTab>;
+
+pub struct LogsTab;
+
+impl RenderableTab for LogsTab {
+    fn title(&self) -> &str {
+        "Overview"
+    }
+
+    fn ui(&self, ui: &mut egui::Ui, state: &mut GlobalState) {
+    // Laat de seriele communicatie zien in een scrollable area.
+    eframe::egui::ScrollArea::vertical()
+    .auto_shrink(false)
+    .show(ui, |ui| {
+        for log in &state.logs {
+            ui.label(egui::RichText::new(log).monospace());
+        }
+        ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+    });
+    }
+}
+
+pub struct Settingstab;
+
+
+impl RenderableTab for Settingstab {
+    fn title(&self) -> &str {
+        "Settings"
+    }
+
+    fn ui(&self, ui: &mut egui::Ui, state: &mut GlobalState) {
+        // Geef de breedte, lengte en snelheid weer in de GUI.
+        ui.group(|ui| {
+            ui.label(format!("Width: {}mm", state.dimensions.x));
+            ui.label(format!("Length: {}mm", state.dimensions.y));
+            ui.label(format!("Snelheid: {}mm", state.speed));
+        });  
+    }
+}
+
+
+impl egui_tiles::Behavior<Tab> for GlobalState {
+    fn tab_title_for_pane(&mut self, tab: &Tab) -> egui::WidgetText {
+        tab.title().into()
+    }
+
+    fn pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _tile_id: egui_tiles::TileId,
+        tab: &mut Tab,
+    ) -> egui_tiles::UiResponse {
+        tab.ui(ui, self);
+        Default::default()
+    }
+
+    fn tab_outline_stroke(
+        &self,
+        _visuals: &egui::Visuals,
+        _tiles: &egui_tiles::Tiles<Tab>,
+        _tile_id: egui_tiles::TileId,
+        _tab_state: &egui_tiles::TabState,
+    ) -> egui::Stroke {
+        egui::Stroke::NONE
+    }
+
+    /// The height of the bar holding tab titles.
+    fn tab_bar_height(&self, _style: &egui::Style) -> f32 {
+        re_ui::DesignTokens::title_bar_height()
+    }
+
+    /// What are the rules for simplifying the tree?
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        egui_tiles::SimplificationOptions {
+            all_panes_must_have_tabs: true,
+            ..Default::default()
+        }
     }
 }
