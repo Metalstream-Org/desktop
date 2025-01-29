@@ -1223,6 +1223,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "egui_material_icons",
+ "egui_plot",
  "egui_tiles",
  "rand",
  "re_log",
@@ -1466,6 +1467,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1456a754392e6007785d625c4f17b0150d57c3e41b14b0ea282dee653d25046"
 dependencies = [
  "egui",
+]
+
+[[package]]
+name = "egui_plot"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c226cae80a6ee10c4d3aaf9e33bd9e9b2f1c0116b6036bdc2a1cfc9d2d0dcc10"
+dependencies = [
+ "ahash",
+ "egui",
+ "emath",
 ]
 
 [[package]]

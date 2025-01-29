@@ -23,8 +23,6 @@ const KNOWN_MANUFACTURER: &str = "Espressif"; // Vervang door de daadwerkelijke 
 struct ConnectionInfo {
     port_path: String,
     baudrate: u32,
-    is_connected: bool,
-    // connection: Box<dyn SerialPort>,
 }
 
 impl ConnectionInfo {
@@ -32,8 +30,6 @@ impl ConnectionInfo {
         ConnectionInfo {
             port_path,
             baudrate,
-            is_connected: true,
-            // connection
         }
     }
 }
@@ -75,24 +71,14 @@ impl fmt::Display for ParsedMessage {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug)]
-struct SensorSample {
-    timestamp: u64,
-    value: u16,
-}
-
 #[derive(Default)]
 pub struct GlobalState {
     is_connected: Arc<AtomicBool>,
     connection_info: Arc<Mutex<Option<ConnectionInfo>>>,
     logs: VecDeque<String>,  // Optimaliseer logs-opslag
-    // tx_channel: (std::sync::mpsc::Sender<ChannelMessage>, std::sync::mpsc::Receiver<ChannelMessage>),
-    // rx_channel: (std::sync::mpsc::Sender<ChannelMessage>, std::sync::mpsc::Receiver<ChannelMessage>),
-    log_receiver: Option<Receiver<ParsedMessage>>,  // Voor inkomende logs
     serial_port_path: String,
     
     connection_states: [bool; 8],
-    sensor_values: [SensorSample; 8],
     thread_spawned: bool,
     dimensions: Point,
     speed: f64,
@@ -101,6 +87,7 @@ pub struct GlobalState {
 struct MyApp {
     tree: egui_tiles::Tree<Tab>,
     state: GlobalState,
+    rx_channel: (std::sync::mpsc::Sender<ParsedMessage>, std::sync::mpsc::Receiver<ParsedMessage>),
 }
 
 impl MyApp {
@@ -119,11 +106,12 @@ impl MyApp {
         Self {
             tree,
             state: Default::default(),
+            rx_channel: channel(),
+            // tx_channel: channel(),
         }
     }
 
     fn spawn_serial_thread(&mut self) {
-        let (sender, receiver) = channel();
         // let (receiver, sender) = channel();
 
         let port_path = Arc::new(self.state.serial_port_path.clone());
@@ -131,6 +119,10 @@ impl MyApp {
 
 
         let is_connected_clone = self.state.is_connected.clone();
+        let (tx_channel, _) = &self.rx_channel;
+        let thread_tx = tx_channel.clone();
+        // let (_, rx_channel) = &self.tx_channel;
+        // let thread_rx = rx_channel.clone();
         std::thread::spawn(move || {
             loop {
                 let port_result = serialport::new(&*port_path, 115200)
@@ -178,7 +170,7 @@ impl MyApp {
                                                         fields,
                                                     };
                                 
-                                                    sender
+                                                    thread_tx
                                                     .send(parsed_message)
                                                     .ok();
                                                     
@@ -214,9 +206,6 @@ impl MyApp {
                 }
             }
         });
-    
-
-        self.state.log_receiver = Some(receiver);
     }
 }
 
@@ -243,48 +232,43 @@ impl eframe::App for MyApp {
             }
         }
         
-        if let Some(receiver) = &self.state.log_receiver {
-            for log_message in receiver.try_iter() {
-                // self.state.logs.push_back(format!("{} - command: {} - fields: {:?}", log_message.timestamp, log_message.command, log_message.fields));
-                self.state.logs.push_back(log_message.to_string());
+        let (_, in_receiver) = &self.rx_channel;
+        for log_message in in_receiver.try_iter() {
+            self.state.logs.push_back(log_message.to_string());
 
-                if self.state.logs.len() > 100 {
-                    self.state.logs.pop_front();
-                }
+            if self.state.logs.len() > 100 {
+                self.state.logs.pop_front();
+            }
 
-                match log_message.command.as_str()
-                {
-                    "SMS" => {
-                        if let Some(id) = log_message.fields.get("ID") {
-                            let index = id.parse::<usize>().unwrap()-1;
+            match log_message.command.as_str()
+            {
+                "SMS" => {
+                    if let Some(id) = log_message.fields.get("ID") {
+                        let index = id.parse::<usize>().unwrap()-1;
 
-                            if let Some(connected) = log_message.fields.get("C") {
-                                self.state.connection_states[index] = connected.parse::<u8>().unwrap() != 0;
-                            }
-
-                            if let (Some(Ok(timestamp)), Some(Ok(value))) = (
-                                log_message.fields.get("T").map(|t| t.parse::<u64>()),
-                                log_message.fields.get("V").map(|v| v.parse::<u16>()),
-                            ) {
-                                self.state.sensor_values[index] = SensorSample { timestamp, value };
-                            }
-                        };
-                    },
-                    "MET" => {
-                        if let (Some(Ok(width)), Some(Ok(length)), Some(Ok(speed))) = (
-                            log_message.fields.get("W").map(|t| t.parse::<f64>()),
-                            log_message.fields.get("L").map(|v| v.parse::<f64>()),
-                            log_message.fields.get("S").map(|v| v.parse::<f64>()),
-                        ) {
-                            self.state.dimensions = Point::new(width, length);
-                            self.state.speed = speed;
+                        if let Some(connected) = log_message.fields.get("C") {
+                            self.state.connection_states[index] = connected.parse::<u8>().unwrap() != 0;
                         }
 
-                        println!("{:?}", log_message.fields)
-
-                    },
-                    _ => println!("else"),
-                }
+                        // if let (Some(Ok(timestamp)), Some(Ok(value))) = (
+                        //     log_message.fields.get("T").map(|t| t.parse::<u64>()),
+                        //     log_message.fields.get("V").map(|v| v.parse::<u16>()),
+                        // ) {
+                        //     self.state.sensor_values[index] = SensorSample { timestamp, value };
+                        // }
+                    };
+                },
+                "MET" => {
+                    if let (Some(Ok(width)), Some(Ok(length)), Some(Ok(speed))) = (
+                        log_message.fields.get("W").map(|t| t.parse::<f64>()),
+                        log_message.fields.get("L").map(|v| v.parse::<f64>()),
+                        log_message.fields.get("S").map(|v| v.parse::<f64>()),
+                    ) {
+                        self.state.dimensions = Point::new(width, length);
+                        self.state.speed = speed;
+                    }
+                },
+                _ => println!("else"),
             }
         }
 
@@ -293,32 +277,8 @@ impl eframe::App for MyApp {
 
         egui::TopBottomPanel::top("top_bar")
             .frame(re_ui::DesignTokens::top_panel_frame())
-            // .exact_height(top_bar_style.height)
             .show(ctx, |ui| {
-                #[cfg(not(target_arch = "wasm32"))]
-                if !re_ui::NATIVE_WINDOW_BAR {
-                    // Interact with background first, so that buttons in the top bar gets input priority
-                    // (last added widget has priority for input).
-                    let title_bar_response = ui.interact(
-                        ui.max_rect(),
-                        ui.id().with("background"),
-                        egui::Sense::click(),
-                    );
-                    if title_bar_response.double_clicked() {
-                        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                    } else if title_bar_response.is_pointer_button_down_on() {
-                        // TODO(emilk): This should probably only run on `title_bar_response.drag_started_by(PointerButton::Primary)`,
-                        // see https://github.com/emilk/egui/pull/4656
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
-                }
-
                 egui::menu::bar(ui, |ui| {
-                    // ui.set_height(top_bar_style.height);
-                    // ui.add_space(top_bar_style.indent);
-
                     ui.menu_button("File", |ui| {
                         
                     });
@@ -344,7 +304,7 @@ impl eframe::App for MyApp {
             });
 
         
-            egui::SidePanel::left("left_panel")
+        egui::SidePanel::left("left_panel")
             .width_range(150.0..=300.0)
             .resizable(true)
             .frame(egui::Frame {
@@ -393,14 +353,7 @@ impl eframe::App for MyApp {
                 fill: ctx.style().visuals.panel_fill,
                 ..Default::default()
             }).show(ctx, |ui| {
-
                 self.tree.ui(&mut self.state, ui);
-
-                for (i, sample) in self.state.sensor_values.iter().enumerate() {
-                    ui.group(|ui: &mut egui::Ui| {
-                        ui.label(format!("S0{}: {}", i+1, sample.value.to_string()));
-                    });
-                }
             });
 
 
@@ -455,7 +408,6 @@ impl RenderableTab for LogsTab {
 
 pub struct Settingstab;
 
-
 impl RenderableTab for Settingstab {
     fn title(&self) -> &str {
         "Settings"
@@ -463,14 +415,11 @@ impl RenderableTab for Settingstab {
 
     fn ui(&self, ui: &mut egui::Ui, state: &mut GlobalState) {
         // Geef de breedte, lengte en snelheid weer in de GUI.
-        ui.group(|ui| {
-            ui.label(format!("Width: {}mm", state.dimensions.x));
-            ui.label(format!("Length: {}mm", state.dimensions.y));
-            ui.label(format!("Snelheid: {}mm", state.speed));
-        });  
+        ui.label(format!("Width: {}mm", state.dimensions.x));
+        ui.label(format!("Length: {}mm", state.dimensions.y));
+        ui.label(format!("Snelheid: {}mm", state.speed));
     }
 }
-
 
 impl egui_tiles::Behavior<Tab> for GlobalState {
     fn tab_title_for_pane(&mut self, tab: &Tab) -> egui::WidgetText {
@@ -483,7 +432,10 @@ impl egui_tiles::Behavior<Tab> for GlobalState {
         _tile_id: egui_tiles::TileId,
         tab: &mut Tab,
     ) -> egui_tiles::UiResponse {
-        tab.ui(ui, self);
+        egui::Frame::default().inner_margin(re_ui::DesignTokens::view_padding()).show(ui, |ui| {
+            tab.ui(ui, self);
+        });
+
         Default::default()
     }
 
