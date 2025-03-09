@@ -936,6 +936,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "circular-queue"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d34327ead1c743a10db339de35fb58957564b99d248a67985c55638b22c59b5"
+dependencies = [
+ "version_check",
+]
+
+[[package]]
 name = "clean-path"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1219,6 +1228,7 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
+ "circular-queue",
  "eframe",
  "egui",
  "egui_extras",
@@ -1228,8 +1238,6 @@ dependencies = [
  "rand",
  "re_log",
  "re_ui",
- "serde",
- "serde_json",
  "serialport",
 ]
 

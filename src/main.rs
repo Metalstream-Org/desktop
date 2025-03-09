@@ -1,23 +1,19 @@
-use eframe::wgpu::core::global::Global;
-use eframe::wgpu::hal::vulkan::CommandEncoder;
 use eframe::{egui, CreationContext};
 use egui::accesskit::Point;
-use egui::debug_text::print;
-use egui::{Id, Order};
-use re_log::external::log::log_enabled;
-use re_ui::{DesignTokens, UiExt};
-use serialport::{available_ports, SerialPort, SerialPortBuilder, SerialPortType};
-use std::collections::{HashMap, VecDeque};
-use std::fmt::{self, format};
+use egui::Id;
+use re_ui::UiExt;
+use serialport::{available_ports, SerialPortType};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::sync::mpsc::{Receiver, channel};
 
-
 const TARGET_FRAME_RATE: usize = 60;
-const KNOWN_MANUFACTURER: &str = "Espressif"; // Vervang door de daadwerkelijke fabrikant die je verwacht
+// Wordt gebruikt voor het scannen naar de Metalshare Hub
+const KNOWN_MANUFACTURER: &str = "Espressif";
+// Aantal sensoren die worden gebruikt
+const NUM_SENSORS: usize = 8;
 
 #[derive(Clone)]
 struct ConnectionInfo {
@@ -35,16 +31,27 @@ impl ConnectionInfo {
 }
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_app_id("metalstream").with_inner_size([720.0, 480.0]),
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id("metalstream")
+            .with_decorations(!re_ui::CUSTOM_WINDOW_DECORATIONS)
+            .with_fullsize_content_view(re_ui::FULLSIZE_CONTENT)
+            .with_inner_size([800.0, 600.0])
+            .with_title_shown(!re_ui::FULLSIZE_CONTENT)
+            .with_titlebar_buttons_shown(!re_ui::CUSTOM_WINDOW_DECORATIONS)
+            .with_titlebar_shown(!re_ui::FULLSIZE_CONTENT)
+            .with_transparent(re_ui::CUSTOM_WINDOW_DECORATIONS),
 
         ..Default::default()
     };
 
     eframe::run_native(
         "Metalshare",
-        options,
-        Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),
+        native_options,
+        Box::new(move |cc| {
+            re_ui::apply_style_and_install_loaders(&cc.egui_ctx);
+            Ok(Box::new(MyApp::new(cc)))
+        }),
     )
 }
 
@@ -55,11 +62,12 @@ struct ParsedMessage {
     fields: HashMap<String, String>,
 }
 
-impl fmt::Display for ParsedMessage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+// Formatter voor logs
+impl std::fmt::Display for ParsedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "[{}] {}: {}",
+            "[{}] {} {}",
             self.timestamp,
             self.command,
             self.fields
@@ -71,23 +79,51 @@ impl fmt::Display for ParsedMessage {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
+pub struct Measurement {
+    id: u8,
+    connected: bool,
+    value: u16,
+}
+
+// Globale applicatie state
 pub struct GlobalState {
     is_connected: Arc<AtomicBool>,
     connection_info: Arc<Mutex<Option<ConnectionInfo>>>,
-    logs: VecDeque<String>,  // Optimaliseer logs-opslag
+    logs: VecDeque<String>,
     serial_port_path: String,
     
     connection_states: [bool; 8],
     thread_spawned: bool,
     dimensions: Point,
     speed: f64,
+    measurements: BTreeMap<u8, Measurement>,
+
+    show_side_panel: bool,
+}
+
+impl Default for GlobalState {
+    fn default() -> Self {
+        Self {
+            is_connected: Arc::new(AtomicBool::new(false)),
+            connection_info: Arc::new(Mutex::new(None)),
+            logs: VecDeque::new(),
+            serial_port_path: String::new(),
+            connection_states: [false; 8],
+            thread_spawned: false,
+            dimensions: Point::default(),
+            speed: 0.0,
+            measurements: BTreeMap::new(),
+            show_side_panel: true,
+        }
+    }
 }
 
 struct MyApp {
     tree: egui_tiles::Tree<Tab>,
     state: GlobalState,
-    rx_channel: (std::sync::mpsc::Sender<ParsedMessage>, std::sync::mpsc::Receiver<ParsedMessage>),
+    log_receiver: Option<Receiver<ParsedMessage>>,
+    visualization_tab: Arc<Mutex<VisualizationTab>>,
 }
 
 impl MyApp {
@@ -96,33 +132,33 @@ impl MyApp {
         re_ui::apply_style_and_install_loaders(&cc.egui_ctx);
         egui_material_icons::initialize(&cc.egui_ctx);
 
-        let tabs: Vec<Tab> = vec![
-            Arc::new(LogsTab),
-            Arc::new(Settingstab),
-        ];
+        let visualization_tab = Arc::new(Mutex::new(VisualizationTab::new()));
 
-        let tree = egui_tiles::Tree::new_tabs(Id::new("bla"), tabs);
+        let tabs: Vec<Tab> = vec![
+            Arc::new(Mutex::new(ResultsTab)),
+            visualization_tab.clone(),
+            Arc::new(Mutex::new(LogsTab)),
+        ];
+        
+
+        let tree = egui_tiles::Tree::new_vertical(Id::new("bla"), tabs);
         
         Self {
             tree,
             state: Default::default(),
-            rx_channel: channel(),
-            // tx_channel: channel(),
+            log_receiver: Default::default(),
+            visualization_tab,
         }
     }
 
     fn spawn_serial_thread(&mut self) {
-        // let (receiver, sender) = channel();
+        let (sender, receiver) = channel();
 
         let port_path = Arc::new(self.state.serial_port_path.clone());
         let connection_info = self.state.connection_info.clone();
-
-
         let is_connected_clone = self.state.is_connected.clone();
-        let (tx_channel, _) = &self.rx_channel;
-        let thread_tx = tx_channel.clone();
-        // let (_, rx_channel) = &self.tx_channel;
-        // let thread_rx = rx_channel.clone();
+
+        // Handel de seriele communicatie in een aparte thread om de GUI niet te blokkeren
         std::thread::spawn(move || {
             loop {
                 let port_result = serialport::new(&*port_path, 115200)
@@ -130,24 +166,22 @@ impl MyApp {
                     .open();
 
                 match port_result {
-                    Ok(bla) => {
+                    Ok(mut port) => {
                         is_connected_clone.store(true, Ordering::Relaxed);
-
                         *connection_info.lock().unwrap() = Some(ConnectionInfo::new((*port_path).clone(), 115200));
-                        
-                        
-                        let mut port = bla;
-                        let mut buffer = vec![0; 1024]; 
+
+                        let mut buffer = vec![0; 1024];
                         loop {
                             match port.read(&mut buffer) {
                                 Ok(size) if size > 0 => {
                                     let received_chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
 
+                                    // Check of het bericht compleet is
                                     if received_chunk.contains('$') && received_chunk.contains('#') {
                                         if let Some(start) = received_chunk.find('$') {
                                             if let Some(end) = received_chunk[start..].find('#') {
                                                 let full_message = &received_chunk[start..=start + end];
-                                
+
                                                 // Split de berichten in delen
                                                 let parts: Vec<&str> = full_message[1..full_message.len() - 1].split(':').collect();
                                                 if parts.len() >= 2 {
@@ -155,7 +189,7 @@ impl MyApp {
                                                     let command = parts[1].to_string();
 
                                                     let mut fields = std::collections::HashMap::new();
-                                
+
                                                     for field in parts.iter().skip(2) {
                                                         if let Some((key, value)) = field.split_once('=') {
                                                             // Toevoegen aan het veld
@@ -169,43 +203,40 @@ impl MyApp {
                                                         command,
                                                         fields,
                                                     };
-                                
-                                                    thread_tx
-                                                    .send(parsed_message)
-                                                    .ok();
-                                                    
+
+                                                    sender.send(parsed_message).ok();
                                                 }
                                             }
                                         }
                                     }
-                                },
+                                }
                                 Ok(_) => {
-                                    println!("Ok(_):")
-                                },
-                                Err(err) => {
-                                    match err.kind() {
-                                        std::io::ErrorKind::TimedOut => {
-                                            continue;
-                                        },
-                                        _ => {
-                                            println!("andere serial error {}", err);
-                                            is_connected_clone.store(false, Ordering::Relaxed);
-                                            break;
-                                        }
+                                    continue;
+                                }
+                                Err(err) => match err.kind() {
+                                    // Negeer timeouts
+                                    std::io::ErrorKind::TimedOut => {
+                                        continue;
                                     }
-                                }, // Negeer timeouts
+                                    _ => {
+                                        println!("Serial error {}", err);
+                                        // Zet de verbinding naar false
+                                        is_connected_clone.store(false, Ordering::Relaxed);
+                                        break;
+                                    }
+                                },
                             }
                         }
-
-                        drop(port);
-                    },
+                    }
                     Err(err) => {
                         println!("Error: handle serial thread error {}", err.to_string());
                         std::thread::sleep(Duration::from_secs(1));
-                    },
+                    }
                 }
             }
         });
+
+        self.log_receiver = Some(receiver);
     }
 }
 
@@ -219,7 +250,7 @@ impl eframe::App for MyApp {
         }
 
         if !is_connected {
-            let ports = available_ports().expect("bla");
+            let ports = available_ports().unwrap();
 
             for port in ports {
                 if let SerialPortType::UsbPort(usb) = &port.port_type {
@@ -232,8 +263,8 @@ impl eframe::App for MyApp {
             }
         }
         
-        let (_, in_receiver) = &self.rx_channel;
-        for log_message in in_receiver.try_iter() {
+        if let Some(receiver) = &self.log_receiver {
+        for log_message in receiver.try_iter() {
             self.state.logs.push_back(log_message.to_string());
 
             if self.state.logs.len() > 100 {
@@ -246,19 +277,25 @@ impl eframe::App for MyApp {
                     if let Some(id) = log_message.fields.get("ID") {
                         let index = id.parse::<usize>().unwrap()-1;
 
-                        if let Some(connected) = log_message.fields.get("C") {
-                            self.state.connection_states[index] = connected.parse::<u8>().unwrap() != 0;
-                        }
+                        if let (Some(Ok(id)), Some(Ok(connected_parsed)), Some(Ok(value))) = (
+                            log_message.fields.get("ID").map(|t| t.parse::<u8>()),
+                            log_message.fields.get("C").map(|v| v.parse::<u8>()),
+                            log_message.fields.get("V").map(|v| v.parse::<u16>()),
+                        ) {
+                            let connected = connected_parsed != 0;
+                            self.state.connection_states[index] = connected;
 
-                        // if let (Some(Ok(timestamp)), Some(Ok(value))) = (
-                        //     log_message.fields.get("T").map(|t| t.parse::<u64>()),
-                        //     log_message.fields.get("V").map(|v| v.parse::<u16>()),
-                        // ) {
-                        //     self.state.sensor_values[index] = SensorSample { timestamp, value };
-                        // }
+                            let measurement = Measurement { id, connected, value };
+                            self.state.measurements.insert(id, measurement);
+
+                            let mut tab = self.visualization_tab.lock().unwrap();
+                            tab.add_sensor_value(measurement.clone());
+
+                        }
                     };
                 },
                 "MET" => {
+                    println!("MET message: {:?}", log_message.fields);
                     if let (Some(Ok(width)), Some(Ok(length)), Some(Ok(speed))) = (
                         log_message.fields.get("W").map(|t| t.parse::<f64>()),
                         log_message.fields.get("L").map(|v| v.parse::<f64>()),
@@ -266,23 +303,31 @@ impl eframe::App for MyApp {
                     ) {
                         self.state.dimensions = Point::new(width, length);
                         self.state.speed = speed;
+                        println!("{:?}", self.state.dimensions);
                     }
                 },
                 _ => println!("else"),
             }
         }
-
-
-        // let top_bar_style = ctx.top_bar_style(false);
+        }
 
         egui::TopBottomPanel::top("top_bar")
             .frame(re_ui::DesignTokens::top_panel_frame())
             .show(ctx, |ui| {
-                egui::menu::bar(ui, |ui| {
-                    ui.menu_button("File", |ui| {
-                        
+                ui.horizontal(|ui| {
+                    egui::menu::bar(ui, |ui| {
+                        ui.menu_button("File", |ui| {
+                            ui.add(egui::Button::new("Quit"))
+                        });
                     });
-                });
+    
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.medium_icon_toggle_button(
+                            &re_ui::icons::LEFT_PANEL_TOGGLE,
+                            &mut self.state.show_side_panel,
+                        );
+                    });    
+                })
             });
 
         egui::TopBottomPanel::bottom("bottom_panel")
@@ -312,7 +357,7 @@ impl eframe::App for MyApp {
                 inner_margin: egui::Margin::same(5.0),
                 ..Default::default()
             })
-            .show(ctx, |ui| {
+            .show_animated(ctx, self.state.show_side_panel, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add(egui::Image::new(egui::include_image!("../assets/Logo_Full_White_Transparent.png")).max_width(100.0));
                 });
@@ -328,13 +373,15 @@ impl eframe::App for MyApp {
                 re_ui::list_item::list_item_scope(ui, "sensor_states", |ui| {
                 ui.section_collapsing_header("Sensoren & Status")
                     .show(ui, |ui| {
-                        for (i, connected) in self.state.connection_states.iter().enumerate() {
+                        for measurement_hash in self.state.measurements.iter() {
+                            let (id, measurement) = measurement_hash;
+
                             ui.horizontal(|ui| {
-                                ui.label(format!("Sensor S0{}", i + 1));
+                                ui.label(format!("Sensor S0{}", id));
                                 
                                 // Laat een icoontje zien op basis van de verbonden toestand
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if *connected {
+                                    if measurement.connected {
                                         ui.label(egui_material_icons::icon_text(egui_material_icons::icons::ICON_WIFI_TETHERING)
                                             .color(egui::Color32::WHITE)
                                             .size(16.0));
@@ -359,6 +406,9 @@ impl eframe::App for MyApp {
 
             // Laat een los window zien als de hoofdapplicatie niet kan verbinden met het master board
             if !is_connected {
+                self.state.speed = 0.0;
+                self.state.dimensions = Point::new(0.0, 0.0);
+
                 ctx.show_viewport_immediate(
                     egui::ViewportId::from_hash_of("connection_window"),
                     egui::ViewportBuilder::default()
@@ -381,19 +431,19 @@ impl eframe::App for MyApp {
 
 pub trait RenderableTab {
     fn title(&self) -> &str;
-    fn ui(&self, ui: &mut egui::Ui, state: &mut GlobalState);
+    fn ui(&mut self, ui: &mut egui::Ui, state: &mut GlobalState);
 }
 
-pub type Tab = Arc<dyn RenderableTab>;
+pub type Tab = Arc<Mutex<dyn RenderableTab>>;
 
 pub struct LogsTab;
 
 impl RenderableTab for LogsTab {
     fn title(&self) -> &str {
-        "Overview"
+        "Logs"
     }
 
-    fn ui(&self, ui: &mut egui::Ui, state: &mut GlobalState) {
+    fn ui(&mut self, ui: &mut egui::Ui, state: &mut GlobalState) {
     // Laat de seriele communicatie zien in een scrollable area.
     eframe::egui::ScrollArea::vertical()
     .auto_shrink(false)
@@ -406,24 +456,116 @@ impl RenderableTab for LogsTab {
     }
 }
 
-pub struct Settingstab;
+pub struct ResultsTab;
 
-impl RenderableTab for Settingstab {
+impl RenderableTab for ResultsTab {
     fn title(&self) -> &str {
-        "Settings"
+        "Results"
     }
 
-    fn ui(&self, ui: &mut egui::Ui, state: &mut GlobalState) {
+    fn ui(&mut self, ui: &mut egui::Ui, state: &mut GlobalState) {
         // Geef de breedte, lengte en snelheid weer in de GUI.
-        ui.label(format!("Width: {}mm", state.dimensions.x));
-        ui.label(format!("Length: {}mm", state.dimensions.y));
-        ui.label(format!("Snelheid: {}mm", state.speed));
+        ui.label(format!("Width: {} mm", state.dimensions.x));
+        ui.label(format!("Length: {} mm", state.dimensions.y));
+        ui.label(format!("Snelheid: {} cm/s", state.speed));
+
+        for i in 0..NUM_SENSORS {
+            if let Some(measurement) = state.measurements.get(&((i+1) as u8)) {
+                ui.label(format!("Sensor S0{}: {}", measurement.id, measurement.value));
+            }
+        }
+    }
+}
+
+// // 250 => samples per seconds * (band lengte (cm) / band snelheid (cm/s)) => 10*(100\4)
+const SAMPLE_BUF_SIZE: usize = 10*(100/4);
+
+// even nummer
+const VP_WIDTH: usize = 100;
+const VP_HEIGHT: usize = 250;
+
+const PX_PER_SENSOR: usize = VP_WIDTH / NUM_SENSORS;
+
+
+pub struct VisualizationTab {
+    cache: Cache,
+    frame_counter: usize,
+    sensor_buffer: VecDeque<Measurement>,
+}
+
+impl VisualizationTab {
+    pub fn new() -> Self {
+        Self {
+            cache: Cache::default(),
+            frame_counter: 0,
+            sensor_buffer: VecDeque::with_capacity(SAMPLE_BUF_SIZE),
+        }
+    }
+
+    pub fn add_sensor_value(&mut self, measurement: Measurement) {
+        if self.sensor_buffer.len() >= SAMPLE_BUF_SIZE {
+            self.sensor_buffer.pop_front();
+        }
+        self.sensor_buffer.push_back(measurement);
+    }
+}
+
+impl RenderableTab for VisualizationTab {
+    fn title(&self) -> &str {
+        "Visualization"
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, state: &mut GlobalState) {
+        let size = egui::Vec2::new(VP_WIDTH as f32, VP_HEIGHT as f32);
+
+        self.cache.resize(size);
+        // self.cache.pixels.fill(egui::Color32::BLACK);
+
+        for y in 1..VP_HEIGHT {
+            let src_start = y * VP_WIDTH;
+            let dest_start = (y - 1) * VP_WIDTH;
+            self.cache.pixels.copy_within(src_start..src_start + VP_WIDTH, dest_start);
+        }
+
+        let mut new_row = vec![0.0; VP_WIDTH];
+
+        for (sensor_idx, measurement) in state.measurements.values().enumerate() {
+            if sensor_idx >= NUM_SENSORS {
+                continue;
+            }
+
+            let intensity = (measurement.value as f32 / 2000.0).clamp(0.0, 1.0);
+
+            let start_x = sensor_idx * PX_PER_SENSOR;
+            let end_x = start_x + PX_PER_SENSOR;
+
+            for x in start_x..end_x {
+                let weight = 1.0 - ((x - start_x) as f32 / PX_PER_SENSOR as f32);
+                new_row[x] += intensity * weight;
+            }
+        }
+
+        // **Stap 4: Nieuwe rij pixels invullen onderaan**
+        let last_row_idx = (VP_HEIGHT - 1) * VP_WIDTH;
+        for (x, &intensity) in new_row.iter().enumerate() {
+            self.cache.pixels[last_row_idx + x] = egui::Color32::from_gray((intensity * 255.0) as u8);
+        }
+
+        // **Stap 5: Texture genereren en renderen**
+        let texture = egui::ColorImage {
+            size: [VP_WIDTH, VP_HEIGHT],
+            pixels: self.cache.pixels.clone(),
+        };
+
+        let handle = ui.ctx().load_texture("sensor", texture, Default::default());
+        ui.add(egui::Image::new(&handle).fit_to_exact_size(size));
     }
 }
 
 impl egui_tiles::Behavior<Tab> for GlobalState {
     fn tab_title_for_pane(&mut self, tab: &Tab) -> egui::WidgetText {
-        tab.title().into()
+        let locked_tab = tab.lock().unwrap();
+        locked_tab.title().into()
     }
 
     fn pane_ui(
@@ -433,7 +575,8 @@ impl egui_tiles::Behavior<Tab> for GlobalState {
         tab: &mut Tab,
     ) -> egui_tiles::UiResponse {
         egui::Frame::default().inner_margin(re_ui::DesignTokens::view_padding()).show(ui, |ui| {
-            tab.ui(ui, self);
+            let mut locked_tab = tab.lock().unwrap();
+            locked_tab.ui(ui, self);
         });
 
         Default::default()
@@ -449,16 +592,34 @@ impl egui_tiles::Behavior<Tab> for GlobalState {
         egui::Stroke::NONE
     }
 
-    /// The height of the bar holding tab titles.
     fn tab_bar_height(&self, _style: &egui::Style) -> f32 {
         re_ui::DesignTokens::title_bar_height()
     }
 
-    /// What are the rules for simplifying the tree?
     fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
         egui_tiles::SimplificationOptions {
             all_panes_must_have_tabs: true,
             ..Default::default()
         }
+    }
+}
+
+
+#[derive(Default)]
+struct Cache {
+    pixels: Vec<egui::Color32>,
+    size: egui::Vec2,
+}
+
+impl Cache {
+    fn resize(&mut self, size: egui::Vec2) {
+        if size == self.size {
+            return;
+        }
+
+        self.pixels = Vec::new();
+        self.pixels
+            .resize((size.x*size.y) as usize, egui::Color32::default());
+        self.size = size;
     }
 }
